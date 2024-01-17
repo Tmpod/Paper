@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tmpod <tom@tmpod.dev>
+Date: Wed, 17 Jan 2024 01:27:48 +0000
+Subject: [PATCH] Implement unbounded in-memory caching for world configs
+
+Also disable spigot config saving on each world creation.
+
+This significantly improves performance of world creation.
+In case of a cache miss, it will do the regular file-based
+configuration reading, and then add it to the cache.
+
+Since all world creation is done on the main thread, there's
+no need to use a concurrent data structure, thus saving on
+performance.
+
+Default configurations are also cached after their first load, on a
+separate level from regular world configurations.
+This means that if a world's config is created, but it has no backing
+file, it will get the cached default. If both Spigot and Paper configs
+are missing, it won't cache the config at all, since it's just a fully
+default set.
+
+`PaperConfigurations#reloadConfigs` reloads both paper and spigot
+configs.
+
+diff --git a/src/main/java/io/papermc/paper/configuration/Configurations.java b/src/main/java/io/papermc/paper/configuration/Configurations.java
+index c01b4393439838976965823298f12e4762e72eff..686fbe59c746881ad77a907343e4f32cbe3d7b1f 100644
+--- a/src/main/java/io/papermc/paper/configuration/Configurations.java
++++ b/src/main/java/io/papermc/paper/configuration/Configurations.java
+@@ -10,6 +10,7 @@ import net.minecraft.server.level.ServerLevel;
+ import org.checkerframework.checker.nullness.qual.Nullable;
+ import org.jetbrains.annotations.MustBeInvokedByOverriders;
+ import org.slf4j.Logger;
++import org.spigotmc.SpigotWorldConfig;
+ import org.spongepowered.configurate.CommentedConfigurationNode;
+ import org.spongepowered.configurate.ConfigurateException;
+ import org.spongepowered.configurate.ConfigurationNode;
+@@ -41,6 +42,9 @@ public abstract class Configurations<G, W> {
+     protected final String globalConfigFileName;
+     protected final String defaultWorldConfigFileName;
+     protected final String worldConfigFileName;
++    @Nullable
++    protected ConfigurationNode defaultsNode = null;
++    protected final WorldConfigsCache worldConfigsCache = new WorldConfigsCache();
+ 
+     public Configurations(
+         final Path globalFolder,
+@@ -165,6 +169,7 @@ public abstract class Configurations<G, W> {
+         final DefaultWorldLoader result = this.createDefaultWorldLoader(false, contextMap, configFile);
+         final YamlConfigurationLoader loader = result.loader();
+         final ConfigurationNode node = loader.load();
++        this.defaultsNode = node;
+         if (result.isNewFile()) { // add version to new files
+             node.node(Configuration.VERSION_FIELD).raw(this.worldConfigVersion());
+         } else {
+@@ -208,14 +213,20 @@ public abstract class Configurations<G, W> {
+     }
+ 
+     protected W createWorldConfig(final ContextMap contextMap, final CheckedFunction<ConfigurationNode, W, SerializationException> creator) throws IOException {
+-        final Path defaultsConfigFile = this.globalFolder.resolve(this.defaultWorldConfigFileName);
+-        final YamlConfigurationLoader defaultsLoader = this.createDefaultWorldLoader(true, this.createDefaultContextMap(contextMap.require(REGISTRY_ACCESS)).build(), defaultsConfigFile).loader();
+-        final ConfigurationNode defaultsNode = defaultsLoader.load();
++        return createWorldConfig(contextMap, creator, true).config();
++    }
++
++    protected WorldConfigurationResult<W> createWorldConfig(final ContextMap contextMap, final CheckedFunction<ConfigurationNode, W, SerializationException> creator, boolean createIfNotExists) throws IOException {
++        assert this.defaultsNode != null;
+ 
+         boolean newFile = false;
+         final Path dir = contextMap.require(WORLD_DIRECTORY);
+         final Path worldConfigFile = dir.resolve(this.worldConfigFileName);
+         if (Files.notExists(worldConfigFile)) {
++            if (!createIfNotExists) {
++                return new WorldConfigurationResult<>(creator.apply(this.defaultsNode), newFile);
++            }
++
+             PaperConfigurations.createDirectoriesSymlinkAware(dir);
+             Files.createFile(worldConfigFile); // create empty file as template
+             newFile = true;
+@@ -232,10 +243,10 @@ public abstract class Configurations<G, W> {
+             this.verifyWorldConfigVersion(contextMap, worldNode);
+         }
+         this.applyWorldConfigTransformations(contextMap, worldNode);
+-        this.applyDefaultsAwareWorldConfigTransformations(contextMap, worldNode, defaultsNode);
++        this.applyDefaultsAwareWorldConfigTransformations(contextMap, worldNode, this.defaultsNode);
+         trySaveFileNode(worldLoader, worldNode, worldConfigFile.toString()); // save before loading node NOTE: don't save the backing node after loading it, or you'll fill up the world-specific config
+-        worldNode.mergeFrom(defaultsNode);
+-        return creator.apply(worldNode);
++        worldNode.mergeFrom(this.defaultsNode);
++        return new WorldConfigurationResult<>(creator.apply(worldNode), newFile);
+     }
+ 
+     protected void verifyWorldConfigVersion(final ContextMap contextMap, final ConfigurationNode worldNode) {
+@@ -352,4 +363,6 @@ public abstract class Configurations<G, W> {
+             return "ContextKey{" + this.name + "}";
+         }
+     }
++
++    public record WorldConfigurationResult<W>(W config, boolean newFile) { }
+ }
+diff --git a/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java b/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
+index fa1c0aee8c3a4d0868482cf5c703bbfd08e09874..30e636dc975f273610e4dd2976463c806e443948 100644
+--- a/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
++++ b/src/main/java/io/papermc/paper/configuration/PaperConfigurations.java
+@@ -132,15 +132,9 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
+         """;
+ 
+     @VisibleForTesting
+-    public static final Supplier<SpigotWorldConfig> SPIGOT_WORLD_DEFAULTS = Suppliers.memoize(() -> new SpigotWorldConfig(RandomStringUtils.randomAlphabetic(255)) {
+-        @Override // override to ensure "verbose" is false
+-        public void init() {
+-            SpigotConfig.readConfig(SpigotWorldConfig.class, this);
+-        }
+-    });
++    public static final Supplier<SpigotWorldConfig> SPIGOT_WORLD_DEFAULTS = SpigotWorldConfig::getDefault;
+     public static final ContextKey<Supplier<SpigotWorldConfig>> SPIGOT_WORLD_CONFIG_CONTEXT_KEY = new ContextKey<>(new TypeToken<Supplier<SpigotWorldConfig>>() {}, "spigot world config");
+ 
+-
+     public PaperConfigurations(final Path globalFolder) {
+         super(globalFolder, GlobalConfiguration.class, WorldConfiguration.class, GLOBAL_CONFIG_FILE_NAME, WORLD_DEFAULTS_CONFIG_FILE_NAME, WORLD_CONFIG_FILE_NAME);
+     }
+@@ -314,8 +308,9 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
+         try {
+             this.initializeGlobalConfiguration(reloader(this.globalConfigClass, GlobalConfiguration.get()));
+             this.initializeWorldDefaultsConfiguration(server.registryAccess());
++            this.worldConfigsCache.clear();
+             for (ServerLevel level : server.getAllLevels()) {
+-                this.createWorldConfig(createWorldContextMap(level), reloader(this.worldConfigClass, level.paperConfig()));
++                this.worldConfigsCache.reload(level, this);
+             }
+         } catch (Exception ex) {
+             throw new RuntimeException("Could not reload paper configuration files", ex);
+diff --git a/src/main/java/io/papermc/paper/configuration/WorldConfigsCache.java b/src/main/java/io/papermc/paper/configuration/WorldConfigsCache.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8dbf87b08888b72ab33fc9e7fa147806b5b8474
+--- /dev/null
++++ b/src/main/java/io/papermc/paper/configuration/WorldConfigsCache.java
+@@ -0,0 +1,108 @@
++package io.papermc.paper.configuration;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.HashMap;
++import java.util.Map;
++import net.minecraft.core.RegistryAccess;
++import net.minecraft.resources.ResourceLocation;
++import net.minecraft.server.level.ServerLevel;
++import org.spigotmc.SpigotWorldConfig;
++import org.spongepowered.configurate.ConfigurationNode;
++import org.spongepowered.configurate.serialize.SerializationException;
++import org.spongepowered.configurate.util.CheckedFunction;
++
++public final class WorldConfigsCache {
++    public record Entry(io.papermc.paper.configuration.WorldConfiguration paper, SpigotWorldConfig spigot) {
++    }
++
++    private final Map<String, Entry> map = new HashMap<>();
++
++    public void clear() {
++        map.clear();
++    }
++
++    public Entry load(final String levelName,
++                      final PaperConfigurations paperConfigs,
++                      final Path levelPath,
++                      final ResourceLocation worldKey,
++                      final RegistryAccess regAccess,
++                      final CheckedFunction<ConfigurationNode, WorldConfiguration, SerializationException> creator) {
++        var spigotConfig = SpigotWorldConfig.getOrDefault(levelName);
++        try {
++            var paperConfig =
++                paperConfigs.createWorldConfig(
++                    PaperConfigurations.createWorldContextMap(
++                        levelPath,
++                        levelName,
++                        worldKey,
++                        spigotConfig,
++                        regAccess
++                    ),
++                    creator,
++                    false
++                );
++            var entry = new Entry(
++                paperConfig.config(),
++                spigotConfig
++            );
++
++            // if there's actual configurations either in spigot or in paper, cache, otherwise just return (defaults)
++            // TODO: duplicate isLevelConfigured, too late (irl) to go change that now
++            if (SpigotWorldConfig.isLevelConfigured(levelName) || !paperConfig.newFile()) {
++                map.put(levelName, entry);
++            }
++
++            return entry;
++        } catch (IOException exception) {
++            throw new RuntimeException("Could not create world config for " + levelName, exception);
++        }
++    }
++
++    public Entry reload(final ServerLevel level, final PaperConfigurations paperConfigs) {
++        return get(
++            level.serverLevelData.getLevelName(),
++            paperConfigs,
++            level.convertable.levelDirectory.path(),
++            level.dimension().location(),
++            level.registryAccess(),
++            PaperConfigurations.reloader(paperConfigs.worldConfigClass, level.paperConfig())
++        );
++    }
++
++    public Entry get(final String levelName,
++                     final PaperConfigurations paperConfigs,
++                     final Path levelPath,
++                     final ResourceLocation worldKey,
++                     final RegistryAccess regAccess,
++                     final CheckedFunction<ConfigurationNode, WorldConfiguration, SerializationException> creator
++    ) {
++        var entry = map.get(levelName);
++        if (entry == null) {
++            entry = load(
++                levelName,
++                paperConfigs,
++                levelPath,
++                worldKey,
++                regAccess,
++                creator
++            );
++        }
++        return entry;
++    }
++
++    public Entry get(final String levelName,
++                     final PaperConfigurations paperConfigs,
++                     final Path levelPath,
++                     final ResourceLocation worldKey,
++                     final RegistryAccess regAccess) {
++        return get(
++            levelName,
++            paperConfigs,
++            levelPath,
++            worldKey,
++            regAccess,
++            PaperConfigurations.creator(paperConfigs.worldConfigClass, false)
++        );
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 016b7628b289fb882f3ec15dd5b0cb4e0af72edc..7ab30cc06bb5824a6d95f86d17fd3ed96cc938ea 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -3,9 +3,6 @@ package net.minecraft.server;
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Splitter;
+ import com.google.common.collect.ImmutableList;
+-import co.aikar.timings.Timings;
+-import com.destroystokyo.paper.event.server.PaperServerListPingEvent;
+-import com.google.common.base.Stopwatch;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
+@@ -14,6 +11,7 @@ import com.mojang.authlib.GameProfileRepository;
+ import com.mojang.authlib.minecraft.MinecraftSessionService;
+ import com.mojang.datafixers.DataFixer;
+ import com.mojang.logging.LogUtils;
++import io.papermc.paper.configuration.WorldConfigsCache;
+ import it.unimi.dsi.fastutil.longs.LongIterator;
+ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+ import java.awt.image.BufferedImage;
+@@ -85,7 +83,6 @@ import net.minecraft.server.level.ServerChunkCache;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.server.level.ServerPlayerGameMode;
+-import net.minecraft.server.level.TicketType;
+ import net.minecraft.server.level.progress.ChunkProgressListener;
+ import net.minecraft.server.level.progress.ChunkProgressListenerFactory;
+ import net.minecraft.server.network.ServerConnectionListener;
+@@ -109,7 +106,6 @@ import net.minecraft.util.ProgressListener;
+ import net.minecraft.util.RandomSource;
+ import net.minecraft.util.SignatureValidator;
+ import net.minecraft.util.TimeUtil;
+-import net.minecraft.util.Unit;
+ import net.minecraft.util.datafix.DataFixers;
+ import net.minecraft.util.profiling.EmptyProfileResults;
+ import net.minecraft.util.profiling.ProfileResults;
+@@ -184,8 +180,6 @@ import net.minecraft.world.level.validation.ContentValidationException;
+ import net.minecraft.world.phys.Vec2;
+ import net.minecraft.world.phys.Vec3;
+ import org.bukkit.Bukkit;
+-import org.bukkit.craftbukkit.CraftServer;
+-import org.bukkit.craftbukkit.Main;
+ import org.bukkit.event.server.ServerLoadEvent;
+ // CraftBukkit end
+ 
+@@ -306,6 +300,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     public final double[] recentTps = new double[ 3 ];
+     // Spigot end
+     public final io.papermc.paper.configuration.PaperConfigurations paperConfigurations; // Paper - add paper configuration files
++    public final io.papermc.paper.configuration.WorldConfigsCache worldConfigs;
+     public static long currentTickLong = 0L; // Paper - track current tick as a long
+ 
+     public volatile Thread shutdownThread; // Paper
+@@ -414,6 +409,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         Runtime.getRuntime().addShutdownHook(new org.bukkit.craftbukkit.util.ServerShutdownThread(this));
+         // CraftBukkit end
+         this.paperConfigurations = services.paperConfigurations(); // Paper - add paper configuration files
++        this.worldConfigs = new io.papermc.paper.configuration.WorldConfigsCache();
+     }
+ 
+     private void readScoreboard(DimensionDataStorage persistentStateManager) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index e0dae41eb94da08649cba607975798dc2ac328ad..2dee60bcc020aa41aa77123b25920897b40b0ee8 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -697,7 +697,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         // Holder holder = worlddimension.type(); // CraftBukkit - decompile error
+ 
+         // Objects.requireNonNull(minecraftserver); // CraftBukkit - decompile error
+-        super(iworlddataserver, resourcekey, minecraftserver.registryAccess(), worlddimension.type(), minecraftserver::getProfiler, false, flag, i, minecraftserver.getMaxChainedNeighborUpdates(), gen, biomeProvider, env, spigotConfig -> minecraftserver.paperConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(convertable_conversionsession.levelDirectory.path(), iworlddataserver.getLevelName(), resourcekey.location(), spigotConfig, minecraftserver.registryAccess())), executor); // Paper - create paper world configs; Async-Anti-Xray: Pass executor
++        super(iworlddataserver, resourcekey, minecraftserver.registryAccess(), worlddimension.type(), minecraftserver::getProfiler, false, flag, i, minecraftserver.getMaxChainedNeighborUpdates(), gen, biomeProvider, env, minecraftserver.worldConfigs.get(iworlddataserver.getLevelName(), minecraftserver.paperConfigurations, convertable_conversionsession.levelDirectory.path(), resourcekey.location(), minecraftserver.registryAccess()), executor); // Paper - create paper world configs; Async-Anti-Xray: Pass executor
+         this.pvpMode = minecraftserver.isPvpAllowed();
+         this.convertable = convertable_conversionsession;
+         this.uuid = WorldUUID.getUUID(convertable_conversionsession.levelDirectory.path().toFile());
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index b05e11e6b091c7616df5a9bbef867b06cafe3dc3..422310e40483e86b1b9fe3763e007066a965fb60 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -1,10 +1,7 @@
+ package net.minecraft.world.level;
+ 
+-import co.aikar.timings.Timing;
+-import co.aikar.timings.Timings;
+ import com.destroystokyo.paper.event.server.ServerExceptionEvent;
+ import com.destroystokyo.paper.exception.ServerInternalException;
+-import com.google.common.base.MoreObjects;
+ import com.google.common.collect.Lists;
+ import com.mojang.serialization.Codec;
+ import java.io.IOException;
+@@ -15,9 +12,10 @@ import java.util.function.Consumer;
+ import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import javax.annotation.Nullable;
++import io.papermc.paper.configuration.WorldConfigsCache;
++import io.papermc.paper.configuration.WorldConfiguration;
+ import net.minecraft.CrashReport;
+ import net.minecraft.CrashReportCategory;
+-import net.minecraft.ReportedException;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.core.Holder;
+@@ -38,7 +36,6 @@ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.sounds.SoundEvent;
+ import net.minecraft.sounds.SoundEvents;
+ import net.minecraft.sounds.SoundSource;
+-import net.minecraft.util.AbortableIterationConsumer;
+ import net.minecraft.util.Mth;
+ import net.minecraft.util.RandomSource;
+ import net.minecraft.util.profiling.ProfilerFiller;
+@@ -47,8 +44,6 @@ import net.minecraft.world.TickRateManager;
+ import net.minecraft.world.damagesource.DamageSource;
+ import net.minecraft.world.damagesource.DamageSources;
+ import net.minecraft.world.entity.Entity;
+-import net.minecraft.world.entity.boss.EnderDragonPart;
+-import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+ import net.minecraft.world.entity.item.ItemEntity;
+ import net.minecraft.world.entity.player.Player;
+ import net.minecraft.world.item.ItemStack;
+@@ -94,17 +89,15 @@ import net.minecraft.network.protocol.game.ClientboundSetBorderSizePacket;
+ import net.minecraft.network.protocol.game.ClientboundSetBorderWarningDelayPacket;
+ import net.minecraft.network.protocol.game.ClientboundSetBorderWarningDistancePacket;
+ import org.bukkit.Bukkit;
+-import org.bukkit.Location;
+ import org.bukkit.craftbukkit.CraftServer;
+ import org.bukkit.craftbukkit.CraftWorld;
+ import org.bukkit.craftbukkit.block.CapturedBlockState;
+ import org.bukkit.craftbukkit.block.CraftBlockState;
+ import org.bukkit.craftbukkit.block.data.CraftBlockData;
+ import org.bukkit.craftbukkit.util.CraftSpawnCategory;
+-import org.bukkit.craftbukkit.util.CraftNamespacedKey;
+ import org.bukkit.entity.SpawnCategory;
+ import org.bukkit.event.block.BlockPhysicsEvent;
+-import org.bukkit.event.world.GenericGameEvent;
++import org.spigotmc.SpigotWorldConfig;
+ // CraftBukkit end
+ 
+ public abstract class Level implements LevelAccessor, AutoCloseable {
+@@ -213,9 +206,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+ 
+     public abstract ResourceKey<LevelStem> getTypeKey();
+ 
+-    protected Level(WritableLevelData worlddatamutable, ResourceKey<Level> resourcekey, RegistryAccess iregistrycustom, Holder<DimensionType> holder, Supplier<ProfilerFiller> supplier, boolean flag, boolean flag1, long i, int j, org.bukkit.generator.ChunkGenerator gen, org.bukkit.generator.BiomeProvider biomeProvider, org.bukkit.World.Environment env, java.util.function.Function<org.spigotmc.SpigotWorldConfig, io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, java.util.concurrent.Executor executor) { // Paper - create paper world config; Async-Anti-Xray: Pass executor
+-        this.spigotConfig = new org.spigotmc.SpigotWorldConfig(((net.minecraft.world.level.storage.PrimaryLevelData) worlddatamutable).getLevelName()); // Spigot
+-        this.paperConfig = paperWorldConfigCreator.apply(this.spigotConfig); // Paper - create paper world config
++    protected Level(WritableLevelData worlddatamutable, ResourceKey<Level> resourcekey, RegistryAccess iregistrycustom, Holder<DimensionType> holder, Supplier<ProfilerFiller> supplier, boolean flag, boolean flag1, long i, int j, org.bukkit.generator.ChunkGenerator gen, org.bukkit.generator.BiomeProvider biomeProvider, org.bukkit.World.Environment env, WorldConfigsCache.Entry configs, java.util.concurrent.Executor executor) { // Paper - create paper world config; Async-Anti-Xray: Pass executor
++        this.spigotConfig = configs.spigot();
++        this.paperConfig = configs.paper();
+         this.generator = gen;
+         this.world = new CraftWorld((ServerLevel) this, gen, biomeProvider, env);
+ 
+diff --git a/src/main/java/org/spigotmc/SpigotConfig.java b/src/main/java/org/spigotmc/SpigotConfig.java
+index 6c260403d91d640da0473a3df56e1c5582459fde..124a23c92ea84488935729e871e357f9490fdddb 100644
+--- a/src/main/java/org/spigotmc/SpigotConfig.java
++++ b/src/main/java/org/spigotmc/SpigotConfig.java
+@@ -121,7 +121,7 @@ public class SpigotConfig
+             }
+         }
+         // Paper start
+-        SpigotConfig.save();
++        // SpigotConfig.save();
+     }
+     public static void save() {
+         // Paper end
+diff --git a/src/main/java/org/spigotmc/SpigotWorldConfig.java b/src/main/java/org/spigotmc/SpigotWorldConfig.java
+index 1cf6d4f854d89c515e48e1fb365eb95ff9340765..ee71fd609f14d4f65f598888fac2e7a2a7bd554c 100644
+--- a/src/main/java/org/spigotmc/SpigotWorldConfig.java
++++ b/src/main/java/org/spigotmc/SpigotWorldConfig.java
+@@ -1,11 +1,37 @@
+ package org.spigotmc;
+ 
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import org.bukkit.Bukkit;
+ import org.bukkit.configuration.file.YamlConfiguration;
++import javax.annotation.Nullable;
+ 
+ public class SpigotWorldConfig
+ {
++    @Nullable
++    private static SpigotWorldConfig defaultConfig = null;
++
++    public static boolean isLevelConfigured(String levelName) {
++        return SpigotConfig.config.get("world-settings." + levelName, null) != null;
++    }
++
++    public static SpigotWorldConfig getDefault() {
++        if (defaultConfig == null) {
++            defaultConfig = new SpigotWorldConfig("default") {
++                @Override
++                public void init() {
++                    // Ensure verbose is off
++                    SpigotConfig.readConfig(SpigotWorldConfig.class, this);
++                }
++            };
++        }
++        return defaultConfig;
++    }
++
++    public static SpigotWorldConfig getOrDefault(String levelName) {
++        return isLevelConfigured(levelName) ? new SpigotWorldConfig(levelName) : getDefault();
++    }
+ 
+     private final String worldName;
+     private final YamlConfiguration config;
