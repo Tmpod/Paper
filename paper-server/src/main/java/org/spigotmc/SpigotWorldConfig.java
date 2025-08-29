@@ -1,10 +1,37 @@
 package org.spigotmc;
 
 import java.util.List;
+import javax.annotation.Nullable;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.YamlConfiguration;
 
 public class SpigotWorldConfig {
+    // Paper(tmpod) start - add world config cache
+    @Nullable
+    private static SpigotWorldConfig defaultConfig = null;
+
+    public static boolean isLevelConfigured(String levelName) {
+        return SpigotConfig.config.get("world-settings." + levelName, null) != null;
+    }
+
+    public static SpigotWorldConfig getDefault() {
+        if (defaultConfig == null) {
+            defaultConfig = new SpigotWorldConfig("default") {
+                @Override
+                public void init() {
+                    // Ensure verbose is off
+                    SpigotConfig.readConfig(SpigotWorldConfig.class, this);
+                }
+            };
+        }
+
+        return defaultConfig;
+    }
+
+    public static SpigotWorldConfig getOrDefault(String levelName) {
+        return isLevelConfigured(levelName) ? new SpigotWorldConfig(levelName) : getDefault();
+    }
+    // Paper(tmpod) end - add world config cache
 
     private final String worldName;
     private final YamlConfiguration config;
@@ -134,18 +161,21 @@ public class SpigotWorldConfig {
     }
 
     public double itemMerge;
+
     private void itemMerge() {
         this.itemMerge = this.getDouble("merge-radius.item", 0.5);
         this.log("Item Merge Radius: " + this.itemMerge);
     }
 
     public double expMerge;
+
     private void expMerge() {
         this.expMerge = this.getDouble("merge-radius.exp", -1);
         this.log("Experience Merge Radius: " + this.expMerge);
     }
 
     public int viewDistance;
+
     private void viewDistance() {
         if (SpigotConfig.version < 12) {
             this.set("view-distance", null);
@@ -162,6 +192,7 @@ public class SpigotWorldConfig {
     }
 
     public int simulationDistance;
+
     private void simulationDistance() {
         Object simulationDistanceObject = this.get("simulation-distance", "default");
         this.simulationDistance = (simulationDistanceObject) instanceof Number ? ((Number) simulationDistanceObject).intValue() : -1;
@@ -173,12 +204,14 @@ public class SpigotWorldConfig {
     }
 
     public byte mobSpawnRange;
+
     private void mobSpawnRange() {
         this.mobSpawnRange = (byte) getInt("mob-spawn-range", 8); // Paper - Vanilla
         this.log("Mob Spawn Range: " + this.mobSpawnRange);
     }
 
     public int itemDespawnRate;
+
     private void itemDespawnRate() {
         this.itemDespawnRate = this.getInt("item-despawn-rate", 6000);
         this.log("Item Despawn Rate: " + this.itemDespawnRate);
@@ -249,6 +282,7 @@ public class SpigotWorldConfig {
     public int miscTrackingRange = 96;
     public int displayTrackingRange = 128;
     public int otherTrackingRange = 64;
+
     private void trackingRange() {
         this.playerTrackingRange = this.getInt("entity-tracking-range.players", this.playerTrackingRange);
         this.animalTrackingRange = this.getInt("entity-tracking-range.animals", this.animalTrackingRange);
@@ -263,6 +297,7 @@ public class SpigotWorldConfig {
     public int hopperCheck;
     public int hopperAmount;
     public boolean hopperCanLoadChunks;
+
     private void hoppers() {
         // Set the tick delay between hopper item movements
         this.hopperTransfer = this.getInt("ticks-per.hopper-transfer", 8);
@@ -277,6 +312,7 @@ public class SpigotWorldConfig {
 
     public int arrowDespawnRate;
     public int tridentDespawnRate;
+
     private void arrowDespawnRate() {
         this.arrowDespawnRate = this.getInt("arrow-despawn-rate", 1200);
         this.tridentDespawnRate = this.getInt("trident-despawn-rate", this.arrowDespawnRate);
@@ -284,34 +320,40 @@ public class SpigotWorldConfig {
     }
 
     public boolean zombieAggressiveTowardsVillager;
+
     private void zombieAggressiveTowardsVillager() {
         this.zombieAggressiveTowardsVillager = this.getBoolean("zombie-aggressive-towards-villager", true);
         this.log("Zombie Aggressive Towards Villager: " + this.zombieAggressiveTowardsVillager);
     }
 
     public boolean nerfSpawnerMobs;
+
     private void nerfSpawnerMobs() {
         this.nerfSpawnerMobs = this.getBoolean("nerf-spawner-mobs", false);
         this.log("Nerfing mobs spawned from spawners: " + this.nerfSpawnerMobs);
     }
 
     public boolean enableZombiePigmenPortalSpawns;
+
     private void enableZombiePigmenPortalSpawns() {
         this.enableZombiePigmenPortalSpawns = this.getBoolean("enable-zombie-pigmen-portal-spawns", true);
         this.log("Allow Zombie Pigmen to spawn from portal blocks: " + this.enableZombiePigmenPortalSpawns);
     }
 
     public int dragonDeathSoundRadius;
+
     private void keepDragonDeathPerWorld() {
         this.dragonDeathSoundRadius = this.getInt("dragon-death-sound-radius", 0);
     }
 
     public int witherSpawnSoundRadius;
+
     private void witherSpawnSoundRadius() {
         this.witherSpawnSoundRadius = this.getInt("wither-spawn-sound-radius", 0);
     }
 
     public int endPortalSoundRadius;
+
     private void endPortalSoundRadius() {
         this.endPortalSoundRadius = this.getInt("end-portal-sound-radius", 0);
     }
@@ -376,6 +418,7 @@ public class SpigotWorldConfig {
     public float swimMultiplier;
     public float sprintMultiplier;
     public float otherMultiplier;
+
     private void initHunger() {
         if (SpigotConfig.version < 10) {
             this.set("hunger.walk-exhaustion", null);
@@ -395,6 +438,7 @@ public class SpigotWorldConfig {
 
     public int currentPrimedTnt = 0;
     public int maxTntTicksPerTick;
+
     private void maxTntPerTick() {
         if (SpigotConfig.version < 7) {
             this.set("max-tnt-per-tick", 100);
@@ -404,12 +448,14 @@ public class SpigotWorldConfig {
     }
 
     public int hangingTickFrequency;
+
     private void hangingTickFrequency() {
         this.hangingTickFrequency = this.getInt("hanging-tick-frequency", 100);
     }
 
     public int tileMaxTickTime;
     public int entityMaxTickTime;
+
     private void maxTickTimes() {
         this.tileMaxTickTime = this.getInt("max-tick-time.tile", 50);
         this.entityMaxTickTime = this.getInt("max-tick-time.entity", 50);
@@ -417,16 +463,19 @@ public class SpigotWorldConfig {
     }
 
     public int thunderChance;
+
     private void thunderChance() {
         this.thunderChance = this.getInt("thunder-chance", 100000);
     }
 
     public boolean belowZeroGenerationInExistingChunks;
+
     private void belowZeroGenerationInExistingChunks() {
         this.belowZeroGenerationInExistingChunks = this.getBoolean("below-zero-generation-in-existing-chunks", true);
     }
 
     public boolean unloadFrozenChunks;
+
     private void unloadFrozenChunks() {
         this.unloadFrozenChunks = this.getBoolean("unload-frozen-chunks", false);
     }

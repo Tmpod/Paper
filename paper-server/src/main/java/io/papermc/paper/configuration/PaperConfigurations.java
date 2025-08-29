@@ -333,8 +333,9 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
         try {
             this.initializeGlobalConfiguration(server.registryAccess(), reloader(this.globalConfigClass, GlobalConfiguration.get()));
             this.initializeWorldDefaultsConfiguration(server.registryAccess());
+            this.worldConfigsCache.clear();  // Paper(tmpod) - add world config cache
             for (ServerLevel level : server.getAllLevels()) {
-                this.createWorldConfig(createWorldContextMap(level), reloader(this.worldConfigClass, level.paperConfig()));
+                this.worldConfigsCache.reload(level, this);  // Paper(tmpod) - add world config cache
             }
         } catch (Exception ex) {
             throw new RuntimeException("Could not reload paper configuration files", ex);
@@ -347,7 +348,7 @@ public class PaperConfigurations extends Configurations<GlobalConfiguration, Wor
         );
     }
 
-    private static ContextMap createWorldContextMap(ServerLevel level) {
+    public static ContextMap createWorldContextMap(ServerLevel level) {
         return createWorldContextMap(level.levelStorageAccess.levelDirectory.path(), level.serverLevelData.getLevelName(), level.dimension().location(), level.spigotConfig, level.registryAccess(), level.getGameRules());
     }
 

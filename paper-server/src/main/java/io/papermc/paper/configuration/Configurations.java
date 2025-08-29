@@ -19,6 +19,7 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.GameRules;
+import org.bukkit.World;
 import org.jetbrains.annotations.MustBeInvokedByOverriders;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -42,6 +43,11 @@ public abstract class Configurations<G, W> {
     protected final String globalConfigFileName;
     protected final String defaultWorldConfigFileName;
     protected final String worldConfigFileName;
+    // Paper(tmpod) start - add world config cache
+    @Nullable
+    protected ConfigurationNode defaultsNode = null;
+    protected final WorldConfigsCache worldConfigsCache = new WorldConfigsCache();
+    // Paper(tmpod) end - add world config cache
 
     public Configurations(
         final Path globalFolder,
@@ -168,6 +174,7 @@ public abstract class Configurations<G, W> {
         final DefaultWorldLoader result = this.createDefaultWorldLoader(false, contextMap, configFile);
         final YamlConfigurationLoader loader = result.loader();
         final ConfigurationNode node = loader.load();
+        this.defaultsNode = node;  // Paper(tmpod) - add world config cache
         if (result.isNewFile()) { // add version to new files
             node.node(Configuration.VERSION_FIELD).raw(this.worldConfigVersion());
         } else {
@@ -211,15 +218,22 @@ public abstract class Configurations<G, W> {
     }
 
     protected W createWorldConfig(final ContextMap contextMap, final CheckedFunction<ConfigurationNode, W, SerializationException> creator) throws IOException {
+        return createWorldConfig(contextMap, creator, true).config();
+    }
+
+    protected WorldConfigurationResult<W> createWorldConfig(final ContextMap contextMap, final CheckedFunction<ConfigurationNode, W, SerializationException> creator, boolean createIfNotExists) throws IOException { // Paper(tmpod) - add world config cache
         Preconditions.checkArgument(!contextMap.isDefaultWorldContext(), "cannot create world map with default world context");
-        final Path defaultsConfigFile = this.globalFolder.resolve(this.defaultWorldConfigFileName);
-        final YamlConfigurationLoader defaultsLoader = this.createDefaultWorldLoader(true, this.createDefaultContextMap(contextMap.require(REGISTRY_ACCESS)).build(), defaultsConfigFile).loader();
-        final ConfigurationNode defaultsNode = defaultsLoader.load();
+        Preconditions.checkArgument(defaultsNode != null, "defaults have not been initialized yet"); // Paper(tmpod) - add world config cache
 
         boolean newFile = false;
         final Path dir = contextMap.require(WORLD_DIRECTORY);
         final Path worldConfigFile = dir.resolve(this.worldConfigFileName);
         if (Files.notExists(worldConfigFile)) {
+            // Paper(tmpod) start - add world config cache
+            if (!createIfNotExists)
+                return new WorldConfigurationResult<>(creator.apply(defaultsNode), newFile);
+            // Paper(tmpod) end - add world config cache
+
             PaperConfigurations.createDirectoriesSymlinkAware(dir);
             Files.createFile(worldConfigFile); // create empty file as template
             newFile = true;
@@ -239,7 +253,7 @@ public abstract class Configurations<G, W> {
         this.applyDefaultsAwareWorldConfigTransformations(contextMap, worldNode, defaultsNode);
         this.trySaveFileNode(worldLoader, worldNode, worldConfigFile.toString()); // save before loading node NOTE: don't save the backing node after loading it, or you'll fill up the world-specific config
         worldNode.mergeFrom(defaultsNode);
-        return creator.apply(worldNode);
+        return new WorldConfigurationResult<>(creator.apply(worldNode), newFile); // Paper(tmpod) - add world config cache
     }
 
     protected void verifyWorldConfigVersion(final ContextMap contextMap, final ConfigurationNode worldNode) {
@@ -357,4 +371,6 @@ public abstract class Configurations<G, W> {
             return "ContextKey{" + this.name + "}";
         }
     }
+
+    public record WorldConfigurationResult<W>(W config, boolean newFile) { }
 }

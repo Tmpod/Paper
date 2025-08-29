@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tmpod <tom@tmpod.dev>
+Date: Fri, 29 Aug 2025 12:04:39 +0100
+Subject: [PATCH] Implement unbounded in-memory caching for world configs
+
+See the associated commit on the root repo.
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 9243bb11e3f968d0bf0eb2e3dc9295c0232bc15d..7bf87186714d50259d1d7dea0a498a8df2a2a28e 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -300,6 +300,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     public volatile boolean abnormalExit; // Paper - Improved watchdog support
+     public volatile Thread shutdownThread; // Paper - Improved watchdog support
+     public final io.papermc.paper.configuration.PaperConfigurations paperConfigurations; // Paper - add paper configuration files
++    public final @Nullable io.papermc.paper.configuration.WorldConfigsCache worldConfigs; // Paper(tmpod) - add world config cache
+     public boolean isIteratingOverLevels = false; // Paper - Throw exception on world create while being ticked
+     private final Set<String> pluginsBlockingSleep = new java.util.HashSet<>(); // Paper - API to allow/disallow tick sleeping
+     public static final long SERVER_INIT = System.nanoTime(); // Paper - Lag compensation
+@@ -471,6 +472,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         Runtime.getRuntime().addShutdownHook(new org.bukkit.craftbukkit.util.ServerShutdownThread(this));
+         // CraftBukkit end
+         this.paperConfigurations = services.paperConfigurations(); // Paper - add paper configuration files
++        this.worldConfigs = new io.papermc.paper.configuration.WorldConfigsCache(); // Paper(tmpod) - add world config cache
+     }
+ 
+     private void readScoreboard(DimensionDataStorage dataStorage) {
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index dda8d38ef61672cc714d9e5a475f9b0412ed5ff9..de1cec6e7fe8636527b60fb5ca28c21bd7037e74 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -583,7 +583,20 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         org.bukkit.generator.BiomeProvider biomeProvider // CraftBukkit
+     ) {
+         // CraftBukkit start
+-        super(serverLevelData, dimension, server.registryAccess(), levelStem.type(), false, isDebug, biomeZoomSeed, server.getMaxChainedNeighborUpdates(), gen, biomeProvider, env, spigotConfig -> server.paperConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(levelStorageAccess.levelDirectory.path(), serverLevelData.getLevelName(), dimension.location(), spigotConfig, server.registryAccess(), serverLevelData.getGameRules())), dispatcher); // Paper - create paper world configs; Async-Anti-Xray: Pass executor
++        super(serverLevelData,
++            dimension,
++            server.registryAccess(),
++            levelStem.type(),
++            false,
++            isDebug,
++            biomeZoomSeed,
++            server.getMaxChainedNeighborUpdates(),
++            gen,
++            biomeProvider,
++            env,
++            spigotConfig -> server.paperConfigurations.createWorldConfig(io.papermc.paper.configuration.PaperConfigurations.createWorldContextMap(levelStorageAccess.levelDirectory.path(), serverLevelData.getLevelName(), dimension.location(), spigotConfig, server.registryAccess(), serverLevelData.getGameRules())),
++            server.worldConfigs == null ? null : server.worldConfigs.get(levelStorageAccess.levelDirectory.path(), serverLevelData.getLevelName(), dimension.location(), server.registryAccess(), serverLevelData.getGameRules(), server.paperConfigurations),
++            dispatcher); // Paper - create paper world configs; Async-Anti-Xray: Pass executor
+         this.pvpMode = server.isPvpAllowed();
+         this.levelStorageAccess = levelStorageAccess;
+         this.uuid = org.bukkit.craftbukkit.util.WorldUUID.getOrCreate(levelStorageAccess.levelDirectory.path().toFile());
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index be16627136f7b3979e62308f58b96a2b16ee9f62..1aa188661a3a130dc95cc3c7b6e9228ff9f4c42a 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -826,7 +826,8 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         @Nullable org.bukkit.generator.BiomeProvider biomeProvider, // Paper
+         org.bukkit.World.Environment environment, // Paper
+         java.util.function.Function<org.spigotmc.SpigotWorldConfig, // Spigot - create per world config
+-        io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, // Paper - create paper world config
++            io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, // Paper - create paper world config
++        @Nullable io.papermc.paper.configuration.WorldConfigsCache.Entry configCache, // Paper(tmpod) - add world config cache
+         java.util.concurrent.Executor executor // Paper - Anti-Xray
+     ) {
+         // Paper start - getblock optimisations - cache world height/sections
+@@ -838,8 +839,15 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         this.maxSectionY = this.maxY >> 4;
+         this.sectionsCount = this.maxSectionY - this.minSectionY + 1;
+         // Paper end - getblock optimisations - cache world height/sections
+-        this.spigotConfig = new org.spigotmc.SpigotWorldConfig(((net.minecraft.world.level.storage.PrimaryLevelData) levelData).getLevelName()); // Spigot
+-        this.paperConfig = paperWorldConfigCreator.apply(this.spigotConfig); // Paper - create paper world config
++        // Paper(tmpod) start - add world config cache
++        if (configCache != null) {
++            this.spigotConfig = configCache.spigot();
++            this.paperConfig = configCache.paper();
++        } else {
++            this.spigotConfig = new org.spigotmc.SpigotWorldConfig(((net.minecraft.world.level.storage.PrimaryLevelData) levelData).getLevelName()); // Spigot
++            this.paperConfig = paperWorldConfigCreator.apply(spigotConfig); // Paper - create paper world config
++        }
++        // Paper(tmpod) end - add world config cache
+         this.generator = generator;
+         this.world = new CraftWorld((ServerLevel) this, generator, biomeProvider, environment);
+ 
+@@ -917,6 +925,40 @@ public abstract class Level implements LevelAccessor, UUIDLookup<Entity>, AutoCl
+         this.entityLookup = new ca.spottedleaf.moonrise.patches.chunk_system.level.entity.dfl.DefaultEntityLookup(this); // Paper - rewrite chunk system
+     }
+ 
++    protected Level(
++        WritableLevelData levelData,
++        ResourceKey<Level> dimension,
++        RegistryAccess registryAccess,
++        Holder<DimensionType> dimensionTypeRegistration,
++        boolean isClientSide,
++        boolean isDebug,
++        long biomeZoomSeed,
++        int maxChainedNeighborUpdates,
++        @Nullable org.bukkit.generator.ChunkGenerator generator, // Paper
++        @Nullable org.bukkit.generator.BiomeProvider biomeProvider, // Paper
++        org.bukkit.World.Environment environment, // Paper
++        java.util.function.Function<org.spigotmc.SpigotWorldConfig, // Spigot - create per world config
++        io.papermc.paper.configuration.WorldConfiguration> paperWorldConfigCreator, // Paper - create paper world config
++        java.util.concurrent.Executor executor // Paper - Anti-Xray
++    ) {
++        this(
++            levelData,
++            dimension,
++            registryAccess,
++            dimensionTypeRegistration,
++            isClientSide,
++            isDebug,
++            biomeZoomSeed,
++            maxChainedNeighborUpdates,
++            generator,
++            biomeProvider,
++            environment,
++            paperWorldConfigCreator, // Paper - create paper world config
++            null, // Paper(tmpod) - add world config cache
++            executor
++        );
++    }
++
+     // Paper start - Cancel hit for vanished players
+     // ret true if no collision
+     public final boolean checkEntityCollision(BlockState state, Entity source, net.minecraft.world.phys.shapes.CollisionContext collisionContext,
